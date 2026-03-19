@@ -11,7 +11,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'Wanderlust server running', time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: 'Wanderlust server v2 running', time: new Date().toISOString() }));
     return;
   }
 
@@ -20,18 +20,25 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const params = JSON.parse(body);
-        const { dest, origin, guests, checkin, checkout, budget, destIATA, originIATA } = params;
+        const { dest, origin, guests, checkin, checkout, budget, destIATA, originIATA } = JSON.parse(body);
         if (!ANTHROPIC_API_KEY) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing ANTHROPIC_API_KEY on server' })); return;
+          res.end(JSON.stringify({ error: 'Missing ANTHROPIC_API_KEY' })); return;
         }
-        const starsFilter = budget === 'budget' ? '3' : budget === 'luxury' ? '4,5' : '3,4';
-        const nightsCount = Math.round((new Date(checkout) - new Date(checkin)) / 86400000);
 
-        const hotelPrompt = `Use the lastminute.com MCP tool search_flight_and_hotel_package with EXACTLY these parameters:
-- origin: "${originIATA || 'SAT'}"
-- destination: "${destIATA || dest}"
+        const starsFilter = budget === 'budget' ? '3' : budget === 'luxury' ? '4,5' : '3,4';
+        const fromCode = originIATA || 'SAT';
+        const toCode = destIATA || dest;
+
+        // Step 1: Call lastminute.com directly via Anthropic API with MCP
+        console.log(`Searching: ${fromCode} -> ${toCode} | ${checkin} - ${checkout} | ${guests} adults`);
+
+        const hotelMessages = [
+          {
+            role: 'user',
+            content: `Call the lastminute.com search_flight_and_hotel_package MCP tool with these parameters:
+- origin: "${fromCode}"
+- destination: "${toCode}"
 - date_from: "${checkin}"
 - date_to: "${checkout}"
 - adults: "${guests}"
@@ -39,16 +46,57 @@ const server = http.createServer(async (req, res) => {
 - max_results: 5
 - hotel_stars: "${starsFilter}"
 
-After getting results return ONLY raw JSON no markdown:
-{"hotels":[{"id":0,"search_id":0,"name":"","stars":0,"rating":0,"reviews":0,"dist":0,"price_total":0,"price_per_night":0,"currency":"GBP","amenities":[],"img":"","cancellable":false,"carrier":"","direct":true}],"search_id":0,"dest":"${dest}"}`;
+After the tool returns results, respond with ONLY a valid JSON object like this (no markdown, no extra text):
+{
+  "hotels": [
+    {
+      "id": <internal_id_hotel>,
+      "search_id": <search_id>,
+      "name": "<name>",
+      "stars": <stars or 0>,
+      "rating": <rating divided by 10 to get score out of 10>,
+      "reviews": <reviews count>,
+      "dist": <distance_km>,
+      "price_total": <price_total>,
+      "price_per_night": <price_total divided by number of nights>,
+      "currency": "<currency>",
+      "amenities": [<facilities array>],
+      "img": "<image url>",
+      "cancellable": <cancellable boolean>,
+      "carrier": "<carrier name>",
+      "direct": <flight_direct boolean>
+    }
+  ],
+  "search_id": <search_id from results>
+}`
+          }
+        ];
 
-        const hotelResult = await callClaudeWithMCP(hotelPrompt, [
+        const hotelResponse = await callAnthropicMCP(hotelMessages, [
           { type: 'url', url: 'https://mcp.lastminute.com/mcp', name: 'lastminute' }
         ]);
 
+        let hotels = [];
+        let searchId = null;
+        try {
+          const parsed = extractJSON(hotelResponse);
+          hotels = parsed.hotels || [];
+          searchId = parsed.search_id;
+          console.log(`Got ${hotels.length} hotels`);
+        } catch(e) {
+          console.error('Hotel parse error:', e.message, '| Raw:', hotelResponse.substring(0, 300));
+        }
+
+        // Step 2: Get flights from Kiwi
         const depKiwi = checkin.split('-').reverse().join('/');
         const retKiwi = checkout.split('-').reverse().join('/');
-        const flightPrompt = `Use the kiwi.com MCP tool search-flight with:
+        let flights = [];
+
+        try {
+          const flightMessages = [
+            {
+              role: 'user',
+              content: `Call the kiwi.com search-flight MCP tool with:
 - flyFrom: "${origin}"
 - flyTo: "${dest}"
 - departureDate: "${depKiwi}"
@@ -57,24 +105,38 @@ After getting results return ONLY raw JSON no markdown:
 - curr: "USD"
 - sort: "price"
 
-Return ONLY raw JSON no markdown:
-{"flights":[{"route":"","depart":"","arrive":"","returnDepart":"","airline":"","stops":"","price":0,"currency":"USD","bookUrl":""}]}`;
+After the tool returns results, respond with ONLY a valid JSON object (no markdown):
+{
+  "flights": [
+    {
+      "route": "<origin> -> <destination>",
+      "depart": "<outbound date and time>",
+      "arrive": "<outbound arrival time>",
+      "returnDepart": "<return departure time>",
+      "airline": "<airline name>",
+      "stops": "<Direct or X stop>",
+      "price": <price as number>,
+      "currency": "USD",
+      "bookUrl": "<deeplink url>"
+    }
+  ]
+}`
+            }
+          ];
 
-        let flightResult = { flights: [] };
-        try {
-          flightResult = await callClaudeWithMCP(flightPrompt, [
+          const flightResponse = await callAnthropicMCP(flightMessages, [
             { type: 'url', url: 'https://mcp.kiwi.com', name: 'kiwi' }
           ]);
-        } catch(e) { console.log('Flight search failed:', e.message); }
+          const parsed = extractJSON(flightResponse);
+          flights = parsed.flights || [];
+          console.log(`Got ${flights.length} flights`);
+        } catch(e) {
+          console.log('Flight search non-fatal error:', e.message);
+        }
 
-        const finalResult = {
-          hotels: hotelResult.hotels || [],
-          flights: flightResult.flights || [],
-          search_id: hotelResult.search_id,
-          dest
-        };
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(finalResult));
+        res.end(JSON.stringify({ hotels, flights, search_id: searchId, dest }));
+
       } catch (err) {
         console.error('Search error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -90,10 +152,14 @@ Return ONLY raw JSON no markdown:
     req.on('end', async () => {
       try {
         const { hotelId, searchId, checkin, checkout } = JSON.parse(body);
-        const prompt = `Call lastminute.com select_hotel_options: search_id=${searchId}, hotel_internal_id=${hotelId}, date_from="${checkin}", date_to="${checkout}". Return ONLY raw JSON: {"rooms":[{"name":"","price_total":0,"currency":"GBP","cancellation":"","deeplink":""}]}`;
-        const result = await callClaudeWithMCP(prompt, [
+        const messages = [{
+          role: 'user',
+          content: `Call lastminute.com select_hotel_options with: search_id=${searchId}, hotel_internal_id=${hotelId}, date_from="${checkin}", date_to="${checkout}". Then return ONLY JSON: {"rooms":[{"name":"<room>","price_total":<number>,"currency":"<currency>","cancellation":"<policy>","deeplink":"<url>"}]}`
+        }];
+        const response = await callAnthropicMCP(messages, [
           { type: 'url', url: 'https://mcp.lastminute.com/mcp', name: 'lastminute' }
         ]);
+        const result = extractJSON(response);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (err) {
@@ -103,47 +169,59 @@ Return ONLY raw JSON no markdown:
     });
     return;
   }
+
   res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-async function callClaudeWithMCP(userMessage, mcpServers) {
-  const messages = [{ role: 'user', content: userMessage }];
+// Call Anthropic API with MCP, handling multi-turn tool use automatically
+async function callAnthropicMCP(messages, mcpServers) {
+  const msgHistory = [...messages];
   let finalText = '';
 
-  for (let turn = 0; turn < 6; turn++) {
-    const requestBody = JSON.stringify({
+  for (let turn = 0; turn < 8; turn++) {
+    const body = JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 4000,
-      system: 'You are a travel search assistant. Call the MCP tools to get live data. After getting tool results, return ONLY raw JSON with no markdown, no explanation.',
-      messages,
+      system: 'You are a travel data assistant. Call MCP tools when asked. After receiving tool results, respond with ONLY the raw JSON requested. No markdown fences, no explanation.',
+      messages: msgHistory,
       mcp_servers: mcpServers
     });
 
-    const apiResponse = await callAnthropic(requestBody);
-    if (apiResponse.error) throw new Error(apiResponse.error.message || JSON.stringify(apiResponse.error));
+    const response = await callAnthropic(body);
 
-    const content = apiResponse.content || [];
-    const textBlocks = content.filter(b => b.type === 'text').map(b => b.text).join('');
-    if (textBlocks.trim()) finalText = textBlocks.trim();
+    if (response.error) {
+      throw new Error(`API error: ${response.error.message || JSON.stringify(response.error)}`);
+    }
 
-    console.log(`Turn ${turn + 1}: stop_reason=${apiResponse.stop_reason}, text=${textBlocks.substring(0,100)}`);
+    const content = response.content || [];
+    const stopReason = response.stop_reason;
+    const textContent = content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
 
-    if (apiResponse.stop_reason === 'end_turn') break;
+    console.log(`Turn ${turn+1}: stop=${stopReason} text_len=${textContent.length}`);
 
-    if (apiResponse.stop_reason === 'tool_use') {
-      messages.push({ role: 'assistant', content });
-      messages.push({ role: 'user', content: 'Please now return the final JSON result based on the tool results above. Return ONLY raw JSON, no markdown.' });
+    if (textContent) finalText = textContent;
+
+    if (stopReason === 'end_turn') break;
+
+    if (stopReason === 'tool_use') {
+      // Add assistant's tool call to history and continue
+      msgHistory.push({ role: 'assistant', content });
+      msgHistory.push({ role: 'user', content: 'Now return the final JSON result based on the tool results above. Return ONLY the raw JSON object, no markdown.' });
       continue;
     }
+
     break;
   }
 
-  if (!finalText) throw new Error('No text response from AI');
+  if (!finalText) throw new Error('No text response received from AI');
+  return finalText;
+}
 
-  const cleaned = finalText.replace(/```json|```/g, '').trim();
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('No JSON in response: ' + cleaned.substring(0, 300));
-  return JSON.parse(jsonMatch[0]);
+function extractJSON(text) {
+  const cleaned = text.replace(/```json|```/g, '').trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('No JSON object found in: ' + cleaned.substring(0, 200));
+  return JSON.parse(match[0]);
 }
 
 function callAnthropic(body) {
@@ -160,12 +238,12 @@ function callAnthropic(body) {
         'Content-Length': Buffer.byteLength(body)
       }
     };
-    const req = https.request(options, (apiRes) => {
+    const req = https.request(options, apiRes => {
       let data = '';
       apiRes.on('data', chunk => data += chunk);
       apiRes.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Failed to parse response: ' + data.substring(0, 200))); }
+        catch(e) { reject(new Error('Parse error: ' + data.substring(0, 200))); }
       });
     });
     req.on('error', reject);
@@ -175,6 +253,6 @@ function callAnthropic(body) {
 }
 
 server.listen(PORT, () => {
-  console.log('Wanderlust server on port ' + PORT);
-  console.log('API key: ' + (ANTHROPIC_API_KEY ? 'SET' : 'MISSING'));
+  console.log(`Wanderlust server v2 on port ${PORT}`);
+  console.log(`API key: ${ANTHROPIC_API_KEY ? 'SET' : 'MISSING - add ANTHROPIC_API_KEY env var'}`);
 });

@@ -1,0 +1,12 @@
+{
+  "name": "wanderlust-server",
+  "version": "1.0.0",
+  "description": "Wanderlust Travel Planner backend - proxies live hotel and flight searches",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
